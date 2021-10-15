@@ -1,10 +1,17 @@
 # -*- coding: utf-8 -*-
 
 import numpy as np
-from high_dim_filter_loader import spatial_high_dim_filter, bilateral_high_dim_filter
+# from high_dim_filter_loader import spatial_high_dim_filter, bilateral_high_dim_filter
+from spatial_convolution import SpatialConvolution
+from joint_bilateral_upsample import JointBilateralUpsampling
 from PIL import Image
 import matplotlib.pyplot as plt
-from cv2 import cv2
+from cv2 import cv2, preCornerDetect
+
+'''
+CRF inference
+Is channel-last or will be transferred to channel-last
+'''
 
 def unary_from_labels(labels, n_labels, gt_prob, zero_unsure=True):
     """
@@ -58,31 +65,55 @@ def _softmax(x):
     e_x = np.exp(x - x.max(axis=-1, keepdims=True))
     return e_x / e_x.sum(axis=-1, keepdims=True)
 
-def inference(image, unary, num_classes, theta_alpha, theta_beta, theta_gamma, spatial_compat, bilateral_compat, num_iterations):
+def inference(image, unary, num_classes, theta_alpha, theta_beta, theta_gamma, spatial_compat, bilateral_compat, num_iterations, Q):
+    # Check if `image` is three-channel and (h, w, 3)
+    assert image.ndim == 3 and image.shape[-1] == 3
+    # Check if data scale of `image` is [0, 1]
+    assert image.max() <= 1. and image.min() >= 0.
+    # Check if theta_beta is float and < 1
+    assert theta_beta <= 1.
+
+    height, width, _ = image.shape # channel-last
+
+    # Storage
     spatial_weights = spatial_compat * _diagonal_compatibility((num_classes, num_classes))
     bilateral_weights = bilateral_compat * _diagonal_compatibility((num_classes, num_classes))
     compatibility_matrix = _potts_compatibility((num_classes, num_classes))
-
-    height, width, _ = image.shape
     all_ones = np.ones((height, width, num_classes), dtype=np.float32)
+    spatial_norm_vals = np.zeros_like(all_ones)
+    bilateral_norm_vals = np.zeros_like(all_ones)
+    spatial_out = np.zeros_like(all_ones)
+    bilateral_out = np.zeros_like(all_ones)
 
-    spatial_norm_vals = spatial_high_dim_filter(all_ones, theta_gamma)
-    bilateral_norm_vals = bilateral_high_dim_filter(all_ones, image, theta_alpha, theta_beta)
+    # Spatial and bilateral high-dim filters
+    spatial_high_dim_filter = SpatialConvolution(height, width, space_sigma=theta_gamma)
+    bilateral_high_dim_filter = JointBilateralUpsampling(height, width, space_sigma=theta_alpha, range_sigma=theta_beta)
+
+    # Initialize high-dim filters
+    spatial_high_dim_filter.init()
+    bilateral_high_dim_filter.init(image)
+
+    # Compute symmetric weight
+    spatial_high_dim_filter.compute(all_ones, spatial_norm_vals)
+    bilateral_high_dim_filter.compute(all_ones, bilateral_norm_vals)
+    spatial_norm_vals = 1. / (spatial_norm_vals ** .5 + 1e-20)
+    bilateral_norm_vals = 1. / (bilateral_norm_vals ** .5 + 1e-20)
 
     # Initialize Q
-    Q = _softmax(-unary)
+    Q[:] = _softmax(-unary)
 
     for i in range(num_iterations):
         print('iter {}'.format(i))
         tmp1 = -unary
 
+        # Symmetric normalization and spatial message passing
         # Message passing - spatial
-        spatial_out = spatial_high_dim_filter(Q, theta_gamma)
-        spatial_out /= spatial_norm_vals
+        spatial_high_dim_filter.compute(Q * spatial_norm_vals, spatial_out)
+        spatial_out *= spatial_norm_vals
 
         # Message passing - bilateral
-        bilateral_out = bilateral_high_dim_filter(Q, image, theta_alpha, theta_beta)
-        bilateral_out /= bilateral_norm_vals
+        bilateral_high_dim_filter.compute(Q * bilateral_norm_vals, bilateral_out)
+        bilateral_out *= bilateral_norm_vals
 
         # Message passing
         message_passing = spatial_out.reshape((-1, num_classes)).dot(spatial_weights) + bilateral_out.reshape((-1, num_classes)).dot(bilateral_weights)
@@ -95,14 +126,11 @@ def inference(image, unary, num_classes, theta_alpha, theta_beta, theta_gamma, s
         tmp1 -= pairwise
         
         # Normalize
-        Q = _softmax(tmp1)
-
-    return Q
-
+        Q[:] = _softmax(tmp1)
 
 if __name__ == "__main__":
-    img = cv2.imread('examples/im3.png')
-    anno_rgb = cv2.imread('examples/anno3.png').astype(np.uint32)
+    img = cv2.imread('examples/im2.png')
+    anno_rgb = cv2.imread('examples/anno2.png').astype(np.uint32)
     anno_lbl = anno_rgb[:,:,0] + (anno_rgb[:,:,1] << 8) + (anno_rgb[:,:,2] << 16)
 
     colors, labels = np.unique(anno_lbl, return_inverse=True)
@@ -123,10 +151,10 @@ if __name__ == "__main__":
 
     unary = unary_from_labels(labels, n_labels, 0.7, HAS_UNK)
     unary = np.rollaxis(unary.reshape(n_labels, *img.shape[:2]), 0, 3)
+    pred = np.zeros_like(unary)
 
-    pred = inference(img, unary, n_labels, theta_alpha=80., theta_beta=13., theta_gamma=3., spatial_compat=3., bilateral_compat=10., num_iterations=10)
+    inference(img / 255., unary, n_labels, theta_alpha=80., theta_beta=.0625, theta_gamma=3., spatial_compat=3., bilateral_compat=10., num_iterations=10, Q=pred)
     
-    np.savez('pred.npz', pred)
     MAP = np.argmax(pred, axis=-1)
     plt.imshow(MAP)
     plt.show()
