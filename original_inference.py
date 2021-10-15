@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 
 import numpy as np
-from high_dim_filter import HighDimFilter
+# from high_dim_filter_loader import spatial_high_dim_filter, bilateral_high_dim_filter
+from spatial_convolution import SpatialConvolution
+from joint_bilateral_upsample import JointBilateralUpsampling
 from PIL import Image
 import matplotlib.pyplot as plt
-import cv2
+from cv2 import cv2, preCornerDetect
 
 '''
 CRF inference
@@ -84,8 +86,8 @@ def inference(image, unary, num_classes, theta_alpha, theta_beta, theta_gamma, s
     bilateral_out = np.zeros_like(all_ones)
 
     # Spatial and bilateral high-dim filters
-    spatial_high_dim_filter = HighDimFilter(is_bilateral=False, height=height, width=width, space_sigma=theta_gamma)
-    bilateral_high_dim_filter = HighDimFilter(is_bilateral=True, height=height, width=width, space_sigma=theta_alpha, range_sigma=theta_beta)
+    spatial_high_dim_filter = SpatialConvolution(height, width, space_sigma=theta_gamma)
+    bilateral_high_dim_filter = JointBilateralUpsampling(height, width, space_sigma=theta_alpha, range_sigma=theta_beta)
 
     # Initialize high-dim filters
     spatial_high_dim_filter.init()
