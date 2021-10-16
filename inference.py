@@ -77,6 +77,7 @@ def inference(image, unary, num_classes, theta_alpha, theta_beta, theta_gamma, s
     spatial_weights = spatial_compat * _diagonal_compatibility((num_classes, num_classes))
     bilateral_weights = bilateral_compat * _diagonal_compatibility((num_classes, num_classes))
     compatibility_matrix = _potts_compatibility((num_classes, num_classes))
+    
     all_ones = np.ones((height, width, num_classes), dtype=np.float32)
     spatial_norm_vals = np.zeros_like(all_ones)
     bilateral_norm_vals = np.zeros_like(all_ones)
@@ -105,7 +106,6 @@ def inference(image, unary, num_classes, theta_alpha, theta_beta, theta_gamma, s
         tmp1 = -unary
 
         # Symmetric normalization and spatial message passing
-        # Message passing - spatial
         spatial_high_dim_filter.compute(Q * spatial_norm_vals, spatial_out)
         spatial_out *= spatial_norm_vals
 
@@ -121,14 +121,14 @@ def inference(image, unary, num_classes, theta_alpha, theta_beta, theta_gamma, s
         pairwise = pairwise.reshape((height, width, num_classes))
         
         # Local update
-        tmp1 -= pairwise
+        tmp1 = tmp1 - pairwise
         
         # Normalize
         Q[:] = _softmax(tmp1)
 
 if __name__ == "__main__":
-    img = cv2.imread('examples/im2.png')
-    anno_rgb = cv2.imread('examples/anno2.png').astype(np.uint32)
+    img = cv2.imread('examples/im3.png')
+    anno_rgb = cv2.imread('examples/anno3.png').astype(np.uint32)
     anno_lbl = anno_rgb[:,:,0] + (anno_rgb[:,:,1] << 8) + (anno_rgb[:,:,2] << 16)
 
     colors, labels = np.unique(anno_lbl, return_inverse=True)
