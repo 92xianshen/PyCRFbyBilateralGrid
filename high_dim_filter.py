@@ -179,39 +179,6 @@ class HighDimFilter:
         
         # Initialize interpolation
         self.interpolation.fill(0)
-
-        for perm in it.product(range(2), repeat=self.dim):
-            self.alpha_prod.fill(1)
-            idx = []
-            
-            for i in range(len(perm)):
-                if perm[i] == 1:
-                    self.alpha_prod *= (1. - self.alphas[i])
-                    idx.append(self.left_indices[i])
-                else:
-                    self.alpha_prod *= self.alphas[i]
-                    idx.append(self.right_indices[i])
-
-            self.interpolation += self.alpha_prod * self.data_flat[coord_transform(*idx)]
-
-    def loop_Nlinear_interpolation_2(self) -> np.ndarray:
-        # Coordinate transformation
-        def set_coord_transform():
-            def bilateral_coord_transform(y_idx, x_idx, r_idx, g_idx, b_idx):
-                return ((((y_idx * self.small_width + x_idx) * self.small_rdepth + r_idx) * self.small_gdepth + g_idx) * self.small_bdepth + b_idx).reshape((-1, ))
-
-            def spatial_coord_transform(y_idx, x_idx):
-                return (y_idx * self.small_width + x_idx).reshape((-1))
-
-            if self.is_bilateral:
-                return bilateral_coord_transform
-            else:
-                return spatial_coord_transform
-
-        coord_transform = set_coord_transform()
-        
-        # Initialize interpolation
-        self.interpolation.fill(0)
         offset = np.arange(self.dim, dtype=np.int32) * 2
 
         for perm in it.product(range(2), repeat=self.dim):
@@ -241,7 +208,7 @@ class HighDimFilter:
 
             # ==== Slice ====
             # Interpolation
-            self.loop_Nlinear_interpolation_2()
+            self.loop_Nlinear_interpolation()
 
             # Get result0
             out_ch[:] = self.interpolation.reshape((self.height, self.width))
