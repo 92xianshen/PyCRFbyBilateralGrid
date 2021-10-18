@@ -19,8 +19,8 @@ class HighDimFilter:
         Initializer
 
         Args:
-            height: image height, int
-            width: image width, int
+            height: height of image to be filtered, int
+            width: width of image to be filtered, int
             space_sigma: sigma_s, float
             range_sigma: sigma_r, float
             padding_xy: number of pixel for padding along y and x, int
