@@ -23,8 +23,8 @@ class HighDimFilter:
             width: image width, int
             space_sigma: sigma_s, float
             range_sigma: sigma_r, float
-            padding_xy: number of pixel for padding alongside y and x, int
-            padding_z: number of pixel for padding alongside z, int
+            padding_xy: number of pixel for padding along y and x, int
+            padding_z: number of pixel for padding along z, int
 
         Returns:
             None
@@ -79,9 +79,11 @@ class HighDimFilter:
             self.splat_coords = self.splat_coords.reshape((-1, )) # (h x w, )
 
             # Spatial interpolation index and factor
-            self.left_indices = [y_index, x_index]
-            self.right_indices = [yy_index, xx_index]
-            self.alphas = [y_alpha, x_alpha] # (2, h x w)
+            # self.left_indices = [y_index, x_index]
+            # self.right_indices = [yy_index, xx_index]
+            # self.alphas = [y_alpha, x_alpha] # (2, h x w)
+            self.interp_indices = np.asarray([y_index, yy_index, x_index, xx_index]) # (10, h x w)
+            self.alphas = np.asarray([1. - y_alpha, y_alpha, 1. - x_alpha, x_alpha]) # (10, h x w)
 
             # Spatial convolutional dimension
             self.dim = 2
@@ -127,10 +129,13 @@ class HighDimFilter:
             self.splat_coords = (((splat_yy * self.small_width + splat_xx) * self.small_rdepth + splat_rr) * self.small_gdepth + splat_gg) * self.small_bdepth + splat_bb
             self.splat_coords = self.splat_coords.reshape((-1)) # (h x w, )
 
+            # # Bilateral interpolation index and factor
+            # self.left_indices = [y_index, x_index, r_index, g_index, b_index]
+            # self.right_indices = [yy_index, xx_index, rr_index, gg_index, bb_index]
+            # self.alphas = [y_alpha, x_alpha, r_alpha, g_alpha, b_alpha] # (5, h x w)
             # Bilateral interpolation index and factor
-            self.left_indices = [y_index, x_index, r_index, g_index, b_index]
-            self.right_indices = [yy_index, xx_index, rr_index, gg_index, bb_index]
-            self.alphas = [y_alpha, x_alpha, r_alpha, g_alpha, b_alpha] # (5, h x w)
+            self.interp_indices = np.asarray([y_index, yy_index, x_index, xx_index, r_index, rr_index, g_index, gg_index, b_index, bb_index]) # (10, h x w)
+            self.alphas = np.asarray([1. - y_alpha, y_alpha, 1. - x_alpha, x_alpha, 1. - r_alpha, r_alpha, 1. - g_alpha, g_alpha, 1. - b_alpha, b_alpha]) # (10, h x w)
 
             # Bilateral convolutional dimension
             self.dim = 5
@@ -189,6 +194,32 @@ class HighDimFilter:
 
             self.interpolation += self.alpha_prod * self.data_flat[coord_transform(*idx)]
 
+    def loop_Nlinear_interpolation_2(self) -> np.ndarray:
+        # Coordinate transformation
+        def set_coord_transform():
+            def bilateral_coord_transform(y_idx, x_idx, r_idx, g_idx, b_idx):
+                return ((((y_idx * self.small_width + x_idx) * self.small_rdepth + r_idx) * self.small_gdepth + g_idx) * self.small_bdepth + b_idx).reshape((-1, ))
+
+            def spatial_coord_transform(y_idx, x_idx):
+                return (y_idx * self.small_width + x_idx).reshape((-1))
+
+            if self.is_bilateral:
+                return bilateral_coord_transform
+            else:
+                return spatial_coord_transform
+
+        coord_transform = set_coord_transform()
+        
+        # Initialize interpolation
+        self.interpolation.fill(0)
+        offset = np.arange(self.dim, dtype=np.int32) * 2
+
+        for perm in it.product(range(2), repeat=self.dim):
+            alpha_prod = self.alphas[np.asarray(perm) + offset]
+            idx = self.interp_indices[np.asarray(perm) + offset]
+
+            self.interpolation += np.prod(alpha_prod, axis=0) * self.data_flat[coord_transform(*idx)]
+
     def compute(self, inp: np.ndarray, out: np.ndarray):
         assert inp.shape == out.shape
         _, _, n_channels = inp.shape[:3]
@@ -210,7 +241,7 @@ class HighDimFilter:
 
             # ==== Slice ====
             # Interpolation
-            self.loop_Nlinear_interpolation()
+            self.loop_Nlinear_interpolation_2()
 
             # Get result0
             out_ch[:] = self.interpolation.reshape((self.height, self.width))
