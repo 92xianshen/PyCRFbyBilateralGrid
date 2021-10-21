@@ -10,6 +10,12 @@ import itertools as it
 def clamp(min_value: float, max_value: float, x: np.ndarray) -> np.ndarray:
     return np.maximum(min_value, np.minimum(max_value, x))
 
+# Method to get left and right indices of slice interpolation
+def get_both_indices(size: np.int32, coord: np.ndarray):
+    left_index = clamp(0, size - 1, coord.astype(np.int32))
+    right_index = clamp(0, size - 1, left_index + 1)
+    return left_index, right_index
+
 class HighDimFilter:
     '''
     High-dimensional filter
@@ -35,6 +41,7 @@ class HighDimFilter:
         self.size_type = int
         # Index order: y --> height, x --> width, z --> depth
         self.height, self.width = height, width
+        self.size = height * width
         self.space_sigma, self.range_sigma = space_sigma, range_sigma
         self.padding_xy, self.padding_z = padding_xy, padding_z
 
@@ -44,8 +51,8 @@ class HighDimFilter:
             assert features.ndim == 3 and features.shape[-1] == 3
 
         # Height and width of grid, scala, dtype size_type
-        self.small_height = self.size_type((self.height - 1) / self.space_sigma) + 1 + 2 * self.padding_xy 
-        self.small_width = self.size_type((self.width - 1) / self.space_sigma) + 1 + 2 * self.padding_xy
+        small_height = self.size_type((self.height - 1) / self.space_sigma) + 1 + 2 * self.padding_xy 
+        small_width = self.size_type((self.width - 1) / self.space_sigma) + 1 + 2 * self.padding_xy
 
         # Space coordinates, shape (h, w), dtype int
         yy, xx = np.mgrid[:self.height, :self.width] # (h, w)
@@ -56,38 +63,49 @@ class HighDimFilter:
         slice_yy = yy.astype(np.float32) / self.space_sigma + self.padding_xy
         slice_xx = xx.astype(np.float32) / self.space_sigma + self.padding_xy
 
-        # Left and right indices of the interpolation
-        def get_both_indices(size, coord):
-            left_index = clamp(0, size - 1, coord.astype(np.int32))
-            right_index = clamp(0, size - 1, left_index + 1)
-            return left_index, right_index
-
         # Spatial interpolation index of slice
-        y_index, yy_index = get_both_indices(self.small_height, slice_yy) # (h, w)
-        x_index, xx_index = get_both_indices(self.small_width, slice_xx) # (h, w)
+        y_index, yy_index = get_both_indices(small_height, slice_yy) # (h, w)
+        x_index, xx_index = get_both_indices(small_width, slice_xx) # (h, w)
         
         # Spatial interpolation factor of slice
         y_alpha = (slice_yy - y_index).reshape((-1, )) # (h x w, )
         x_alpha = (slice_xx - x_index).reshape((-1, )) # (h x w, )
 
         if not self.is_bilateral:
-            # Spatial grid shape
-            self.data_shape = (self.small_height, self.small_width)
-            
-            # Spatial splat coordinates, shape (h x w, )
-            self.splat_coords = splat_yy * self.small_width + splat_xx
-            self.splat_coords = self.splat_coords.reshape((-1, )) # (h x w, )
-
-            # Spatial interpolation index and factor
-            # self.left_indices = [y_index, x_index]
-            # self.right_indices = [yy_index, xx_index]
-            # self.alphas = [y_alpha, x_alpha] # (2, h x w)
-            self.interp_indices = np.asarray([y_index, yy_index, x_index, xx_index]) # (10, h x w)
-            self.alphas = np.asarray([1. - y_alpha, y_alpha, 1. - x_alpha, x_alpha]) # (10, h x w)
-
             # Spatial convolutional dimension
             self.dim = 2
+
+            # Spatial interpolation index and factor
+            interp_indices = np.asarray([y_index, yy_index, x_index, xx_index]) # (10, h x w)
+            alphas = np.asarray([1. - y_alpha, y_alpha, 1. - x_alpha, x_alpha]) # (10, h x w)
+
+            # Method of coordinate transformation
+            def coord_transform(idx):
+                return (idx[:, 0, :] * small_width + idx[:, 1, :]).reshape((-1, )) # (2^dim x h x w, )
+
+            # Initialize interpolation
+            offset = np.arange(self.dim) * 2 # [dim, ]
+            # Permutation
+            permutations = np.asarray(list(it.product(range(2), repeat=self.dim))).reshape((-1, self.dim))
+            permutations += offset[np.newaxis, ...]
+            permutations = permutations.reshape((-1, )) # Flatten, [2^dim x dim]
+            alpha_prods = alphas[permutations].reshape((-1, self.dim, self.size)) # [2^dim, dim, h x w]
+            idx = interp_indices[permutations].reshape((-1, self.dim, self.size)) # [2^dim, dim, h x w]
+
+            # Shape of spatial data grid
+            self.data_shape = (small_height, small_width)
+            
+            # Spatial splat coordinates, shape (h x w, )
+            self.splat_coords = (splat_yy * small_width + splat_xx).reshape((-1, ))
+
+            # Interpolation indices and alphas of spatial slice
+            self.slice_idx = coord_transform(idx)
+            self.alpha_prod = alpha_prods.prod(axis=1)
+
         else:
+            # Bilateral convolutional dimension
+            self.dim = 5
+
             # Decompose `features` into r, g, and b channels
             r, g, b = features[..., 0], features[..., 1], features[..., 2]
             r_min, r_max = r.min(), r.max()
@@ -98,9 +116,9 @@ class HighDimFilter:
             rr, gg, bb = r - r_min, g - g_min, b - b_min
 
             # Depth of grid
-            self.small_rdepth = self.size_type(r_delta / self.range_sigma) + 1 + 2 * self.padding_z 
-            self.small_gdepth = self.size_type(g_delta / self.range_sigma) + 1 + 2 * self.padding_z 
-            self.small_bdepth = self.size_type(b_delta / self.range_sigma) + 1 + 2 * self.padding_z
+            small_rdepth = self.size_type(r_delta / self.range_sigma) + 1 + 2 * self.padding_z 
+            small_gdepth = self.size_type(g_delta / self.range_sigma) + 1 + 2 * self.padding_z 
+            small_bdepth = self.size_type(b_delta / self.range_sigma) + 1 + 2 * self.padding_z
 
             # Range coordinates, shape (h, w)
             splat_rr = (rr / self.range_sigma + .5).astype(np.int32) + self.padding_z
@@ -113,32 +131,41 @@ class HighDimFilter:
             slice_bb = bb / self.range_sigma + self.padding_z
 
             # Slice interpolation range coordinate pairs
-            r_index, rr_index = get_both_indices(self.small_rdepth, slice_rr) # (h, w)
-            g_index, gg_index = get_both_indices(self.small_gdepth, slice_gg) # (h, w)
-            b_index, bb_index = get_both_indices(self.small_bdepth, slice_bb) # (h, w)
+            r_index, rr_index = get_both_indices(small_rdepth, slice_rr) # (h, w)
+            g_index, gg_index = get_both_indices(small_gdepth, slice_gg) # (h, w)
+            b_index, bb_index = get_both_indices(small_bdepth, slice_bb) # (h, w)
 
             # Interpolation factors
             r_alpha = (slice_rr - r_index).reshape((-1, )) # (h x w, )
             g_alpha = (slice_gg - g_index).reshape((-1, )) # (h x w, )
             b_alpha = (slice_bb - b_index).reshape((-1, )) # (h x w, )
 
+            # Bilateral interpolation index and factor
+            interp_indices = np.asarray([y_index, yy_index, x_index, xx_index, r_index, rr_index, g_index, gg_index, b_index, bb_index]) # (10, h x w)
+            alphas = np.asarray([1. - y_alpha, y_alpha, 1. - x_alpha, x_alpha, 1. - r_alpha, r_alpha, 1. - g_alpha, g_alpha, 1. - b_alpha, b_alpha]) # (10, h x w)
+
+            # Method of coordinate transformation
+            def coord_transform(idx):
+                return ((((idx[:, 0, :] * small_width + idx[:, 1, :]) * small_rdepth + idx[:, 2, :]) * small_gdepth + idx[:, 3, :]) * small_bdepth + idx[:, 4, :]).reshape((-1, )) # (2^dim x h x w, )
+
+            # Initialize interpolation
+            offset = np.arange(self.dim) * 2 # [dim, ]
+            # Permutation
+            permutations = np.asarray(list(it.product(range(2), repeat=self.dim))).reshape((-1, self.dim))
+            permutations += offset[np.newaxis, ...]
+            permutations = permutations.reshape((-1, )) # Flatten, [2^dim x dim]
+            alpha_prods = alphas[permutations].reshape((-1, self.dim, self.size)) # [2^dim, dim, h x w]
+            idx = interp_indices[permutations].reshape((-1, self.dim, self.size)) # [2^dim, dim, h x w]
+
             # Bilateral grid shape
-            self.data_shape = (self.small_height, self.small_width, self.small_rdepth, self.small_gdepth, self.small_bdepth)
+            self.data_shape = (small_height, small_width, small_rdepth, small_gdepth, small_bdepth)
 
             # Bilateal splat coordinates, shape (h x w, )
-            self.splat_coords = (((splat_yy * self.small_width + splat_xx) * self.small_rdepth + splat_rr) * self.small_gdepth + splat_gg) * self.small_bdepth + splat_bb
-            self.splat_coords = self.splat_coords.reshape((-1)) # (h x w, )
+            self.splat_coords = ((((splat_yy * small_width + splat_xx) * small_rdepth + splat_rr) * small_gdepth + splat_gg) * small_bdepth + splat_bb).reshape((-1, ))
 
-            # # Bilateral interpolation index and factor
-            # self.left_indices = [y_index, x_index, r_index, g_index, b_index]
-            # self.right_indices = [yy_index, xx_index, rr_index, gg_index, bb_index]
-            # self.alphas = [y_alpha, x_alpha, r_alpha, g_alpha, b_alpha] # (5, h x w)
-            # Bilateral interpolation index and factor
-            self.interp_indices = np.asarray([y_index, yy_index, x_index, xx_index, r_index, rr_index, g_index, gg_index, b_index, bb_index]) # (10, h x w)
-            self.alphas = np.asarray([1. - y_alpha, y_alpha, 1. - x_alpha, x_alpha, 1. - r_alpha, r_alpha, 1. - g_alpha, g_alpha, 1. - b_alpha, b_alpha]) # (10, h x w)
-
-            # Bilateral convolutional dimension
-            self.dim = 5
+            # Interpolation indices and alphas of bilateral slice
+            self.slice_idx = coord_transform(idx)
+            self.alpha_prod = alpha_prods.prod(axis=1)
         
         # Bilateral grid and buffer
         self.data = np.zeros(self.data_shape, dtype=np.float32) # For each channel
@@ -147,7 +174,6 @@ class HighDimFilter:
 
         # Interpolation grid
         self.interpolation = np.zeros((self.height * self.width, ), dtype=np.float32)
-        self.alpha_prod = np.ones((self.height * self.width, ), dtype=np.float32)
 
     def convn(self, n_iter: int=2):
         self.buffer.fill(0)
@@ -161,31 +187,11 @@ class HighDimFilter:
                 self.data = np.transpose(self.data, perm)
                 self.buffer = np.transpose(self.buffer, perm)
 
-    def loop_Nlinear_interpolation(self) -> np.ndarray:
-        # Coordinate transformation
-        def set_coord_transform():
-            def bilateral_coord_transform(y_idx, x_idx, r_idx, g_idx, b_idx):
-                return ((((y_idx * self.small_width + x_idx) * self.small_rdepth + r_idx) * self.small_gdepth + g_idx) * self.small_bdepth + b_idx).reshape((-1, ))
-
-            def spatial_coord_transform(y_idx, x_idx):
-                return (y_idx * self.small_width + x_idx).reshape((-1))
-
-            if self.is_bilateral:
-                return bilateral_coord_transform
-            else:
-                return spatial_coord_transform
-
-        coord_transform = set_coord_transform()
-        
+    def Nlinear_interpolation(self) -> np.ndarray:
         # Initialize interpolation
         self.interpolation.fill(0)
-        offset = np.arange(self.dim, dtype=np.int32) * 2
 
-        for perm in it.product(range(2), repeat=self.dim):
-            alpha_prod = self.alphas[np.asarray(perm) + offset]
-            idx = self.interp_indices[np.asarray(perm) + offset]
-
-            self.interpolation += np.prod(alpha_prod, axis=0) * self.data_flat[coord_transform(*idx)]
+        self.interpolation[:] = (self.alpha_prod * self.data_flat[self.slice_idx].reshape((-1, self.size))).sum(axis=0)
 
     def compute(self, inp: np.ndarray, out: np.ndarray):
         assert inp.shape == out.shape
@@ -208,7 +214,7 @@ class HighDimFilter:
 
             # ==== Slice ====
             # Interpolation
-            self.loop_Nlinear_interpolation()
+            self.Nlinear_interpolation()
 
             # Get result0
             out_ch[:] = self.interpolation.reshape((self.height, self.width))
